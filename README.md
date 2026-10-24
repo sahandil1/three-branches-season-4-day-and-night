@@ -1,3 +1,7 @@
+# How the agent was developed
+
+The agent was developed using chatGPT. I wanted the villagers to have different roles and also change their behavior from day to night. They gather around the pump around midday to have a discussion and so on. The meeting of another villager triggers a series of random emotes and then they go about their work. The village does feel lively and random. Also i tried to have them not get stuck infront of each other which makes the game artificial.
+
 # Days at Three Branches agent
 
 Edit `agent.py` to give every one of your villagers a routine. The platform runs a separate `Agent` instance for each NPC, so instances do not share variables or memory. The supplied `sandbox/` directory contains the local runner, types, and village helpers. Leave it unchanged, and leave `requirements.in` and `requirements.txt` alone: the pinned packages match the server.

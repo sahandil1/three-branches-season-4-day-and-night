@@ -1,22 +1,27 @@
-"""Optimized lively Days at Three Branches villager.
+"""Season 4 optimized believable-routines villager.
 
 Architecture
 ------------
 * Finite-state machine for longer-term goals.
 * A small priority/behaviour-tree style decision layer in ``act``.
-* A static navigation graph built once in ``reset``.
-* Cached BFS routes that are recomputed only when a destination changes.
-* Temporary social conversations that interrupt, then resume, normal travel.
+* A static navigation graph built ONCE PER EPISODE and shared by all villager instances.
+* Shared cached BFS routes so repeated start/goal pairs do not rerun pathfinding.
+* Temporary social conversations that interrupt, then return to the CURRENT schedule.
 * Stable ID-based roles so ten villagers running the same code have distinct jobs.
 * ``ROLE_CONFIGS`` keeps role parameters separate from shared behavior.
+* Season 4 phase-aware schedules for dawn, morning, midday, evening, and night.
+* Role-specific visitor reactions plus an evening perception-driven panic ripple.
+* Aggressively throttled perception: social sight/hearing scans run periodically, not every tick.
+* A lamplighter schedule that tends lanterns in the evening while others wind down.
 * Reusable behavioral blocks handle travel, socializing, prop use, and returning home.
 * Lightweight random prop activities that temporarily interrupt normal work.
 
-The main optimization is that expensive layout checks are not repeated on every
-simulation tick. The village geometry is static, so walkability and legal
-cardinal steps are cached once at the start of the day. Role configuration
-changes destinations, pauses, and social parameters while the behavioral blocks
-remain shared and lightweight.
+The main Season 4 optimization is that the ten villagers do NOT each rebuild the
+same village graph. The first Agent instance builds immutable navigation/prop
+data for the episode; the other nine instances reuse those shared structures.
+Path results are also shared. Perception is sampled rather than requested every
+tick. This preserves the believable-routine features while staying inside the
+cast_10 episode compute budget.
 """
 
 from collections import deque
@@ -53,7 +58,15 @@ def _manhattan_keys(first: CellKey, second: CellKey) -> int:
 
 
 class Agent:
-    """A fast villager that explores, uses props, and socializes."""
+    """A fast Season 4 villager with shared static world data."""
+
+    # All ten villagers use the same module/class in local play. Their Agent
+    # objects keep independent behavioral memory, but immutable village geometry
+    # is identical. Sharing it avoids ten copies of the expensive reset scan.
+    _WORLD_CACHE: dict[tuple, dict] = {}
+    _SHARED_PATH_CACHE: dict[tuple, tuple[CellKey, ...]] = {}
+    WORLD_CACHE_LIMIT = 2
+    SHARED_PATH_CACHE_LIMIT = 640
 
     LEAVE_HOME = "LEAVE_HOME"
     MORNING_SWEEP = "MORNING_SWEEP"
@@ -73,6 +86,7 @@ class Agent:
     ROLE_WELL_KEEPER = "well_keeper"
     ROLE_WORKER = "worker"
     ROLE_SWEEPER = "sweeper"
+    ROLE_LAMPLIGHTER = "lamplighter"
     ROLE_WANDERER = "wanderer"
 
     # Full NPC conversations are intentionally disabled while travelling to the
@@ -80,7 +94,18 @@ class Agent:
     SOCIALIZABLE_STATES = {EXPLORE, REST}
     VISITOR_SOCIALIZABLE_STATES = {MORNING_SWEEP, VISIT_PUMP, EXPLORE, REST}
 
+    # Season 4 uses day.phase() for the real schedule. This tick threshold is only
+    # a backwards-compatible fallback if a preset reports the old single "day" phase.
     RETURN_HOME_TICK = 1000
+    ENABLE_RANDOM_NAP = False
+    PANIC_STARTLE_TICKS = 6
+
+    # Performance controls for cast_10. Social discovery does not need to run
+    # every simulation tick. Active conversations refresh more often so facing
+    # and cancellation still feel responsive.
+    SOCIAL_SCAN_INTERVAL = 12
+    ACTIVE_SOCIAL_SCAN_INTERVAL = 3
+    PANIC_SCAN_INTERVAL = 8
 
     # ------------------------------------------------------------------
     # Role configuration
@@ -98,6 +123,7 @@ class Agent:
             "visitor_middle_actions": (2, 5),
             "keeper_pause": (12, 24),
             "morning_sweep": (14, 22),
+            "visitor_style": "calm",
         },
         ROLE_WORKER: {
             "prop_interval": (190, 300),
@@ -109,6 +135,7 @@ class Agent:
             "worker_work_pause": (38, 62),
             "worker_home_pause": (12, 22),
             "morning_sweep": (14, 22),
+            "visitor_style": "reserved",
         },
         ROLE_SWEEPER: {
             "prop_interval": (180, 280),
@@ -119,6 +146,18 @@ class Agent:
             "visitor_middle_actions": (2, 4),
             "sweeper_stop": (12, 20),
             "morning_sweep": (14, 22),
+            "visitor_style": "friendly",
+        },
+        ROLE_LAMPLIGHTER: {
+            "prop_interval": (220, 320),
+            "social_chance": 0.22,
+            "passing_wave_chance": 0.20,
+            "social_cooldown": (85, 125),
+            "npc_middle_actions": (2, 3),
+            "visitor_middle_actions": (1, 3),
+            "sweeper_stop": (10, 16),
+            "morning_sweep": (12, 18),
+            "visitor_style": "busy",
         },
         ROLE_WANDERER: {
             "prop_interval": (100, 180),
@@ -129,6 +168,7 @@ class Agent:
             "visitor_middle_actions": (3, 6),
             "wanderer_dwell": (8, 18),
             "morning_sweep": (14, 22),
+            "visitor_style": "friendly",
         },
     }
 
@@ -157,6 +197,13 @@ class Agent:
         self.role = self._role_for(self.player_id)
         self.config = self.ROLE_CONFIGS[self.role]
 
+        # Season 4 schedule memory. The current phase is checked every tick, while
+        # phase_started_tick lets phase-specific routines make one stable decision.
+        self._phase = day.phase(observation)
+        self._last_phase = self._phase
+        self.phase_started_tick = day.tick(observation)
+        self.evening_started_tick: int | None = None
+
         # Pick exactly one NPC as the mid-day napper. Every agent receives the
         # same episode seed and roster, so they independently agree on the same
         # selected ID without communicating. A different seed can select a
@@ -173,6 +220,16 @@ class Agent:
         self.nap_ticks = 0
         self.nap_done = False
 
+        # One deterministic villager can seed the evening "something is wrong"
+        # reaction. Other villagers only join the panic if they SEE a startle, so
+        # the spread remains perception-driven and can differ with movement.
+        self.panic_starter_id = (
+            npc_ids[(selector + 3) % len(npc_ids)] if npc_ids else None
+        )
+        self.evening_panic = False
+        self.panic_startle_ticks = 0
+        self.panic_arrived_home = False
+
         # Main finite-state machine.
         self.state = self.LEAVE_HOME
         self.state_started_tick = day.tick(observation)
@@ -187,17 +244,100 @@ class Agent:
         self.visited_places: set[CellKey] = set()
         self.dwell_until = 0
 
-        # Static village geometry.
+        # --------------------------------------------------------------
+        # Shared static village cache
+        # --------------------------------------------------------------
+        # Building the full walkability graph is the most expensive reset job.
+        # Season 3 rebuilt it separately for every villager. In cast_10 that
+        # repeats the same layout.walkable/can_step work ten times. Season 4
+        # builds it once for this seeded village and all later Agent instances
+        # reuse the immutable dictionaries/tuples below.
         self.frame = layout.frame(observation)
-        self.walkable_keys: set[CellKey] = set()
-        self.ground_by_key: dict[CellKey, str | None] = {}
-        self.nav_neighbors: dict[CellKey, tuple[CellKey, ...]] = {}
-        self.component_of: dict[CellKey, int] = {}
-        self.outdoor_by_component: dict[int, list[CellKey]] = {}
-        self._build_navigation_graph(observation)
-        self._build_components()
+        self._cell_size = float(self.frame.get("cell_size", 1.0))
+        self._cells_x = int(self.frame["cells_x"])
+        self._cells_y = int(self.frame["cells_y"])
+        self._world_cache_key = (
+            int(seed),
+            self._cells_x,
+            self._cells_y,
+            self._cell_size,
+        )
 
-        # Home information is static, so calculate it once.
+        shared = self.__class__._WORLD_CACHE.get(self._world_cache_key)
+        if shared is None:
+            self.walkable_keys: set[CellKey] = set()
+            self.ground_by_key: dict[CellKey, str | None] = {}
+            self.nav_neighbors: dict[CellKey, tuple[CellKey, ...]] = {}
+            self.component_of: dict[CellKey, int] = {}
+            self.outdoor_by_component: dict[int, list[CellKey]] = {}
+            self._build_navigation_graph(observation)
+            self._build_components()
+
+            all_props = tuple(props.all(observation))
+            pump = next((p for p in all_props if p["type"] == "pump"), None)
+            benches = tuple(p for p in all_props if p["type"] == "bench")
+            lanterns = tuple(sorted(
+                (p for p in all_props if p["type"] == "lantern"),
+                key=lambda p: p["id"],
+            ))
+            prop_approaches = {
+                prop["id"]: self._prop_approach_keys(prop["cell"])
+                for prop in all_props
+            }
+            pump_approaches = (
+                prop_approaches.get(pump["id"], ()) if pump is not None else ()
+            )
+            bench_approaches = {
+                bench["id"]: prop_approaches.get(bench["id"], ())
+                for bench in benches
+            }
+            lantern_approaches = {
+                lantern["id"]: prop_approaches.get(lantern["id"], ())
+                for lantern in lanterns
+            }
+
+            shared = {
+                "walkable_keys": frozenset(self.walkable_keys),
+                "ground_by_key": self.ground_by_key,
+                "nav_neighbors": self.nav_neighbors,
+                "component_of": self.component_of,
+                "outdoor_by_component": {
+                    cid: tuple(cells) for cid, cells in self.outdoor_by_component.items()
+                },
+                "all_props": all_props,
+                "pump": pump,
+                "benches": benches,
+                "lanterns": lanterns,
+                "prop_approaches": prop_approaches,
+                "pump_approaches": pump_approaches,
+                "bench_approaches": bench_approaches,
+                "lantern_approaches": lantern_approaches,
+            }
+
+            # Keep only a tiny number of seeded worlds. Normal watch/eval uses
+            # one active world, so this prevents stale caches growing forever.
+            if len(self.__class__._WORLD_CACHE) >= self.WORLD_CACHE_LIMIT:
+                self.__class__._WORLD_CACHE.clear()
+                self.__class__._SHARED_PATH_CACHE.clear()
+            self.__class__._WORLD_CACHE[self._world_cache_key] = shared
+
+        # Bind shared immutable structures to this Agent instance. Behavioral
+        # state remains entirely private to the villager.
+        self.walkable_keys = shared["walkable_keys"]
+        self.ground_by_key = shared["ground_by_key"]
+        self.nav_neighbors = shared["nav_neighbors"]
+        self.component_of = shared["component_of"]
+        self.outdoor_by_component = shared["outdoor_by_component"]
+        self.all_props = shared["all_props"]
+        self.pump = shared["pump"]
+        self.benches = shared["benches"]
+        self.lanterns = shared["lanterns"]
+        self.prop_approaches = shared["prop_approaches"]
+        self.pump_approaches = shared["pump_approaches"]
+        self.bench_approaches = shared["bench_approaches"]
+        self.lantern_approaches = shared["lantern_approaches"]
+
+        # Home information differs by villager, so this small lookup stays local.
         self.home_id = me.home(observation)
         self.home_door = (
             layout.doorway(observation, self.home_id)
@@ -210,29 +350,6 @@ class Agent:
             else None
         )
         self.home_inside_key = self._find_home_interior_key(self.home_door_key)
-
-        # Props and their static approach cells. Keep all prop records because
-        # villagers can occasionally choose one as a temporary activity.
-        self.all_props = list(props.all(observation))
-
-        self.pump = next((p for p in self.all_props if p["type"] == "pump"), None)
-        self.benches = [p for p in self.all_props if p["type"] == "bench"]
-
-        # Cache approach cells for every prop ONCE. Random prop use therefore
-        # never needs repeated layout.walkable/can_step calls during act().
-        self.prop_approaches: dict[str, tuple[CellKey, ...]] = {
-            prop["id"]: self._prop_approach_keys(prop["cell"])
-            for prop in self.all_props
-        }
-
-        self.pump_approaches: tuple[CellKey, ...] = ()
-        if self.pump is not None:
-            self.pump_approaches = self._prop_approach_keys(self.pump["cell"])
-
-        self.bench_approaches: dict[str, tuple[CellKey, ...]] = {
-            bench["id"]: self.prop_approaches.get(bench["id"], ())
-            for bench in self.benches
-        }
 
         # Pump goal state.
         self.pump_target_key: CellKey | None = None
@@ -262,7 +379,7 @@ class Agent:
 
         # Role-specific routine state. Sweepers all begin with a short visible
         # sweep, then continue a path-maintenance patrol during the day.
-        self.is_morning_sweeper = self.role == self.ROLE_SWEEPER
+        self.is_morning_sweeper = self.role in {self.ROLE_SWEEPER, self.ROLE_LAMPLIGHTER}
         self.morning_sweep_done = False
         self.sweep_ticks = 0
         sweep_low, sweep_high = self.config.get("morning_sweep", (14, 22))
@@ -281,6 +398,10 @@ class Agent:
         self.keeper_next_key: CellKey | None = None
         self._initialize_role_behavior()
 
+        # Midday is a shared village break, but villagers use different nearby
+        # cells so they form a loose social scene rather than one collision pile.
+        self.midday_target_key = self._choose_midday_gather_key()
+
         # Social state. A conversation interrupts behavior but does not destroy
         # the route/destination the villager was following.
         self.social_partner: str | None = None
@@ -297,6 +418,7 @@ class Agent:
         # Per-tick cached perception values. They are refreshed at the start of
         # every act() and then reused by all behavior methods.
         self._tick = day.tick(observation)
+        self._phase = day.phase(observation)
         self._heading = me.heading(observation)
         self._here = me.position(observation)
         self._here_key = _cell_key(layout.cell_at(observation, self._here))
@@ -304,6 +426,12 @@ class Agent:
         self._nearby: list[dict] = []
         self._usable: dict | None = None
         self._expression: dict = {"type": "none", "target": "none"}
+
+        # Perception is deliberately throttled in Season 4. These caches are
+        # refreshed only when a behavior actually needs fresh social data.
+        self._last_seen_tick = -999
+        self._last_nearby_tick = -999
+        self._social_scan_fresh = False
 
     # ------------------------------------------------------------------
     # Main decision loop: behaviour-tree style priority order
@@ -313,6 +441,7 @@ class Agent:
         """Choose one action from current perception plus durable state."""
 
         self._cache_tick(observation)
+        self._handle_phase_transition(observation)
 
         # Update stuck detection from movement requested on the previous tick.
         if self.expected_to_move:
@@ -324,8 +453,11 @@ class Agent:
             self.stuck_ticks = 0
         self.expected_to_move = False
 
-        # Highest strategic priority: leave enough time to get home.
-        if self._tick >= self.RETURN_HOME_TICK and self.state != self.RETURN_HOME:
+        # Highest strategic priority: night belongs to home/sleep. The old tick
+        # threshold remains only as a fallback for a preset with no day phases.
+        night_now = self._phase == "night"
+        fallback_night = self._phase == "day" and self._tick >= self.RETURN_HOME_TICK
+        if (night_now or fallback_night) and self.state != self.RETURN_HOME:
             self._finish_social(self._tick)
             self._cancel_random_prop_activity(schedule_next=False)
             self._set_state(self.RETURN_HOME, observation)
@@ -334,7 +466,9 @@ class Agent:
         # activity, returns to its own house, sleeps for 100 ticks, then resumes
         # its normal role. Strategic end-of-day return-home still outranks this.
         if (
-            self.is_napper
+            self.ENABLE_RANDOM_NAP
+            and self._phase in {"morning", "day"}
+            and self.is_napper
             and not self.nap_done
             and self._tick >= self.nap_start_tick
             and self.state not in {self.NAP_GO_HOME, self.NAP_SLEEP, self.RETURN_HOME}
@@ -356,19 +490,29 @@ class Agent:
             if recovery is not None:
                 return recovery
 
-        # Priority 3: visitor interaction.
+        # Priority 3: evening ambient reaction. A startle can spread through
+        # perception; the lamplighter keeps working so the village still prepares
+        # for dark while other villagers hurry home.
+        if self._phase == "evening" and self.role != self.ROLE_LAMPLIGHTER:
+            self._maybe_trigger_evening_panic()
+            if self.evening_panic:
+                return self._act_evening_panic(observation)
+
+        # Priority 4: visitor interaction. Visitor reactions differ by phase/role.
         if (
-            self._tick >= self.social_block_until
+            self._social_scan_fresh
+            and self._phase != "night"
+            and self._tick >= self.social_block_until
             and self.state in self.VISITOR_SOCIALIZABLE_STATES
         ):
             visitor = self._choose_visitor_partner()
             if visitor is not None:
-                self._start_social(visitor["id"], "visitor")
+                self._start_social(visitor["id"], self._visitor_social_kind())
                 social_action = self._block_socialize(observation)
                 if social_action is not None:
                     return social_action
 
-        # Priority 4: continue an already selected random prop activity. The
+        # Priority 5: continue an already selected random prop activity. The
         # visitor can still interrupt it because visitor interaction is checked
         # first; once that conversation ends, the prop trip resumes.
         if self.random_prop is not None:
@@ -376,10 +520,12 @@ class Agent:
             if prop_action is not None:
                 return prop_action
 
-        # Priority 5: NPC-to-NPC interaction. This is not allowed at the pump,
+        # Priority 6: NPC-to-NPC interaction. This is not allowed at the pump,
         # which avoids large early-day clusters of stationary villagers.
         if (
-            self._tick >= self.social_block_until
+            self._social_scan_fresh
+            and self._phase != "night"
+            and self._tick >= self.social_block_until
             and self.state in self.SOCIALIZABLE_STATES
         ):
             partner = self._choose_social_partner()
@@ -389,7 +535,7 @@ class Agent:
                 if social_action is not None:
                     return social_action
 
-        # Priority 6: occasionally begin a reachable random prop activity.
+        # Priority 7: occasionally begin a reachable random prop activity.
         # This runs only in EXPLORE and only when the current role is at a safe
         # interruption point, so jobs remain visually recognizable.
         if self._maybe_start_random_prop_activity():
@@ -397,7 +543,13 @@ class Agent:
             if prop_action is not None:
                 return prop_action
 
-        # Priority 7: execute the main FSM state.
+        # Priority 8: execute the phase-aware daily schedule / main FSM.
+        if self._phase == "midday":
+            return self._act_midday_gather(observation)
+
+        if self._phase == "evening" and self.role == self.ROLE_LAMPLIGHTER:
+            return self._act_lamplighter_evening(observation)
+
         if self.state == self.NAP_GO_HOME:
             return self._act_nap_go_home(observation)
         if self.state == self.NAP_SLEEP:
@@ -418,31 +570,63 @@ class Agent:
         return self._act_explore(observation)
 
     def _cache_tick(self, observation: ThreeBranchesObservation) -> None:
-        """Read commonly used observation values once per act() call."""
+        """Read common state and throttle expensive perception helpers.
+
+        In cast_10, social sight/hearing discovery is sampled every few ticks.
+        Active conversations refresh more often, while evening panic only needs
+        a periodic sight sample. This keeps reactions believable without asking
+        the engine for full social perception on every act() call.
+        """
 
         self._tick = day.tick(observation)
+        self._phase = day.phase(observation)
         self._heading = me.heading(observation)
         self._here = me.position(observation)
-        self._here_key = _cell_key(layout.cell_at(observation, self._here))
-        self._seen = people.seen(observation)
+        self._here_key = self._position_key_fast(self._here)
+        self._social_scan_fresh = False
 
-        # Hearing/proximity data is only needed when a conversation can start
-        # or is already in progress. Avoid requesting it on unrelated ticks.
-        needs_nearby = (
-            self.social_partner is not None
-            or (
-                self._tick >= self.social_block_until
-                and (
-                    self.state in self.SOCIALIZABLE_STATES
-                    or self.state in self.VISITOR_SOCIALIZABLE_STATES
-                )
+        can_discover_social = (
+            self._phase != "night"
+            and self._tick >= self.social_block_until
+            and (
+                self.state in self.SOCIALIZABLE_STATES
+                or self.state in self.VISITOR_SOCIALIZABLE_STATES
             )
         )
-        self._nearby = people.nearby(observation) if needs_nearby else []
 
-        # Prop selection/expression state is only relevant while using the pump,
-        # a bench, or a temporary random prop. Ordinary exploration stays cheap.
-        if self.state in {self.VISIT_PUMP, self.REST} or self.random_prop is not None:
+        if self.social_partner is not None:
+            # While a conversation is active we need reasonably current partner
+            # positions, but every second tick is visually indistinguishable.
+            if self._tick - self._last_nearby_tick >= self.ACTIVE_SOCIAL_SCAN_INTERVAL:
+                self._seen = people.seen(observation)
+                self._nearby = people.nearby(observation)
+                self._last_seen_tick = self._tick
+                self._last_nearby_tick = self._tick
+
+        elif can_discover_social:
+            # Discovery uses a matched sight+hearing snapshot so a conversation
+            # never starts from stale cached positions.
+            if self._tick - self._last_nearby_tick >= self.SOCIAL_SCAN_INTERVAL:
+                self._seen = people.seen(observation)
+                self._nearby = people.nearby(observation)
+                self._last_seen_tick = self._tick
+                self._last_nearby_tick = self._tick
+                self._social_scan_fresh = True
+
+        elif self._phase == "evening" and self.role != self.ROLE_LAMPLIGHTER:
+            # Panic propagation needs sight but not hearing.
+            if self._tick - self._last_seen_tick >= self.PANIC_SCAN_INTERVAL:
+                self._seen = people.seen(observation)
+                self._last_seen_tick = self._tick
+
+        # Prop state remains event-driven. Only agents that are actually using a
+        # prop pay for these helpers.
+        needs_prop_state = (
+            self.state in {self.VISIT_PUMP, self.REST}
+            or self.random_prop is not None
+            or (self.role == self.ROLE_LAMPLIGHTER and self._phase == "evening")
+        )
+        if needs_prop_state:
             self._usable = props.usable(observation)
             self._expression = me.expression(observation)
         else:
@@ -507,6 +691,272 @@ class Agent:
                 "none",
             ),
             "running",
+        )
+
+    # ------------------------------------------------------------------
+    # Season 4 schedule and believable reactions
+    # ------------------------------------------------------------------
+
+    def _handle_phase_transition(self, observation: ThreeBranchesObservation) -> None:
+        """Reset only the memory that belongs to the phase that just ended.
+
+        Existing visitor conversations may continue across dawn/morning/midday/
+        evening. When they finish, the current phase below determines what the
+        villager does next. Night is the exception: sleep/home outranks reactions.
+        """
+
+        if self._phase == self._last_phase:
+            return
+
+        previous = self._last_phase
+        self._last_phase = self._phase
+        self.phase_started_tick = self._tick
+        self._cancel_random_prop_activity(schedule_next=False)
+        self._clear_navigation(keep_destination=False)
+
+        if self._phase == "evening":
+            self.evening_started_tick = self._tick
+            self.evening_panic = False
+            self.panic_startle_ticks = 0
+            self.panic_arrived_home = False
+            self.lantern_done_ids.clear()
+            self.lantern_target = None
+            self.lantern_target_key = None
+            self.lantern_attempt_ticks = 0
+            self.lantern_use_requested = False
+
+        if self._phase == "night":
+            self._finish_social(self._tick)
+            self._set_state(self.RETURN_HOME, observation)
+            return
+
+        # A new daytime phase gets a fresh role plan. This is what makes a
+        # reaction return to what the schedule says NOW, not to a stale route.
+        if self._phase in {"dawn", "morning", "midday", "evening"}:
+            self.role_phase = "start"
+            self.role_pause_until = 0
+            self.dwell_until = 0
+            self.sweep_stop_until = 0
+            if self.ground_by_key.get(self._here_key) == "interior" and self._phase in {"dawn", "morning"}:
+                self._set_state(self.LEAVE_HOME, observation)
+            else:
+                self._set_state(self.EXPLORE, observation)
+
+    def _visitor_social_kind(self) -> str:
+        """Choose a visitor reaction that fits both the role and time of day."""
+
+        if self._phase == "evening":
+            if self.role == self.ROLE_LAMPLIGHTER:
+                return "visitor_busy"
+            return "visitor_evening"
+        if self._phase == "midday":
+            return "visitor_midday"
+        return f"visitor_{self.config.get('visitor_style', 'calm')}"
+
+    def _maybe_trigger_evening_panic(self) -> None:
+        """Start a fear-of-night reaction from a seed event or a seen startle."""
+
+        if self.evening_panic or self.social_partner is not None:
+            return
+
+        seen_startle = any(
+            people.is_npc(person["id"])
+            and person["id"] != self.player_id
+            and person.get("expression", {}).get("type") == "startle"
+            for person in self._seen
+        )
+
+        seed_startle = (
+            self.player_id == self.panic_starter_id
+            and self.evening_started_tick is not None
+            and self._tick >= self.evening_started_tick + 20
+        )
+
+        if not (seen_startle or seed_startle):
+            return
+
+        self.evening_panic = True
+        self.panic_startle_ticks = 0
+        self.panic_arrived_home = False
+        self._cancel_random_prop_activity(schedule_next=False)
+        self._clear_navigation(keep_destination=False)
+
+    def _act_evening_panic(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction:
+        """Startle briefly, then hurry home while evening is still in progress."""
+
+        if self.panic_startle_ticks < self.PANIC_STARTLE_TICKS:
+            self.panic_startle_ticks += 1
+            return self._stand(self._heading, "startle")
+
+        order, status = self._block_return_home()
+        if status == "arrived":
+            self.panic_arrived_home = True
+            return self._stand(self._heading, "none")
+        return order if order is not None else self._stand(self._heading, "none")
+
+    def _act_midday_gather(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction:
+        """Gather loosely around the village commons without collapsing to one cell."""
+
+        if self.midday_target_key is None:
+            return self._stand(self._heading, "none")
+
+        if self._here_key != self.midday_target_key:
+            move = self._block_travel_to(self.midday_target_key)
+            if move is not None:
+                return move
+            return self._stand(self._heading, "shrug")
+
+        # Face the commons anchor. Midday already has full social interrupts, so
+        # there is no need to scan/sort visible neighbours every gathering tick.
+        if self.pump is not None:
+            pump_key = _cell_key(self.pump["cell"])
+            heading = (
+                geometry.heading_to(self._here, _cell_centre_from_key(pump_key))
+                if pump_key is not None
+                else self._heading
+            )
+        else:
+            heading = self._heading
+
+        # Small ambient gestures make the break readable even without a full
+        # conversation interrupt. Different slots gesture on different ticks.
+        beat = (self._tick + self.player_slot * 7) % 48
+        expression = "nod" if beat == 0 else ("wave" if beat == 24 else "none")
+        return self._stand(heading, expression)
+
+    def _choose_midday_gather_key(self) -> CellKey | None:
+        """Choose one stable commons cell near the pump, spread by player id."""
+
+        component = self._home_component()
+        if component is None:
+            return self.home_door_key
+
+        anchor = None
+        if self.pump is not None:
+            pump_key = _cell_key(self.pump["cell"])
+            if pump_key is not None:
+                approaches = [
+                    key for key in self.pump_approaches
+                    if self.component_of.get(key) == component
+                ]
+                if approaches:
+                    anchor = approaches[0]
+
+        if anchor is None:
+            anchor = self.home_door_key
+        if anchor is None:
+            return None
+
+        pool = [
+            key for key in self.outdoor_by_component.get(component, [])
+            if 2 <= _manhattan_keys(anchor, key) <= 5
+        ]
+        if not pool:
+            pool = [
+                key for key in self.outdoor_by_component.get(component, [])
+                if _manhattan_keys(anchor, key) <= 6
+            ]
+        if not pool:
+            return anchor
+
+        pool.sort(key=lambda key: (_manhattan_keys(anchor, key), key[0], key[1]))
+        return pool[(self.player_slot * 3) % len(pool)]
+
+    def _select_next_lantern(self) -> None:
+        """Select a reachable untended lantern and one of its cached approach cells."""
+
+        self.lantern_target = None
+        self.lantern_target_key = None
+        self.lantern_attempt_ticks = 0
+        self.lantern_use_requested = False
+
+        if self._here_key is None:
+            return
+        component = self.component_of.get(self._here_key)
+        choices: list[tuple[int, dict, CellKey]] = []
+
+        for lantern in self.lanterns:
+            if lantern["id"] in self.lantern_done_ids:
+                continue
+            approaches = [
+                key for key in self.lantern_approaches.get(lantern["id"], ())
+                if self.component_of.get(key) == component
+            ]
+            if not approaches:
+                continue
+            approaches.sort(key=lambda key: _manhattan_keys(self._here_key, key))
+            choices.append((_manhattan_keys(self._here_key, approaches[0]), lantern, approaches[0]))
+
+        if not choices:
+            return
+
+        choices.sort(key=lambda item: (item[0], item[1]["id"]))
+        _, self.lantern_target, self.lantern_target_key = choices[0]
+        self._set_destination_key(self.lantern_target_key)
+
+    def _act_lamplighter_evening(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction:
+        """Visit and use lanterns one at a time during evening."""
+
+        if not self.lanterns:
+            return self._act_sweeper(observation)
+
+        if self.lantern_target is None:
+            self._select_next_lantern()
+
+        if self.lantern_target is None or self.lantern_target_key is None:
+            # Work finished: remain visibly on duty near the commons until night.
+            if self.midday_target_key is not None and self._here_key != self.midday_target_key:
+                move = self._block_travel_to(self.midday_target_key)
+                if move is not None:
+                    return move
+            return self._stand(self._heading, "none")
+
+        lantern_id = self.lantern_target["id"]
+
+        # Confirmation from the previous tick means the one-tick use succeeded.
+        if self.lantern_use_requested and self._expression.get("target") == lantern_id:
+            self.lantern_done_ids.add(lantern_id)
+            self._clear_navigation(keep_destination=False)
+            self.lantern_target = None
+            self.lantern_target_key = None
+            self.lantern_use_requested = False
+            self.lantern_attempt_ticks = 0
+            return self._stand(self._heading, "none")
+
+        use_action = self._block_use_prop(lantern_id)
+        if use_action is not None:
+            self.lantern_use_requested = True
+            self.lantern_attempt_ticks += 1
+            return use_action
+
+        if self._here_key != self.lantern_target_key:
+            move = self._block_travel_to(self.lantern_target_key)
+            if move is not None:
+                return move
+
+        # At the approach but not yet selectable: edge toward it for a bounded
+        # period. If geometry/crowding makes it impossible, skip this lantern.
+        self.lantern_attempt_ticks += 1
+        if self.lantern_attempt_ticks > 30:
+            self.lantern_done_ids.add(lantern_id)
+            self.lantern_target = None
+            self.lantern_target_key = None
+            self.lantern_use_requested = False
+            self._clear_navigation(keep_destination=False)
+            return self._stand(self._heading, "shrug")
+
+        lantern_key = _cell_key(self.lantern_target["cell"])
+        if lantern_key is None:
+            self.lantern_done_ids.add(lantern_id)
+            self.lantern_target = None
+            self.lantern_target_key = None
+            return self._stand(self._heading, "shrug")
+
+        self.expected_to_move = False
+        return action.walk(
+            geometry.heading_to(self._here, _cell_centre_from_key(lantern_key)),
+            0.20,
+            "none",
         )
 
     # ------------------------------------------------------------------
@@ -648,6 +1098,8 @@ class Agent:
         if self.role == self.ROLE_WORKER:
             return self._act_worker(observation)
         if self.role == self.ROLE_SWEEPER:
+            return self._act_sweeper(observation)
+        if self.role == self.ROLE_LAMPLIGHTER:
             return self._act_sweeper(observation)
         return self._act_wanderer(observation)
 
@@ -905,6 +1357,17 @@ class Agent:
         """Whether the current job can safely be interrupted by a prop visit."""
 
         if self.random_prop is not None:
+            return False
+        # Random prop detours are optional liveliness. Restrict them to the roles
+        # that benefit most so workers/sweepers keep clear schedules and avoid
+        # unnecessary candidate scans/path changes in cast_10.
+        if self.role not in {self.ROLE_WELL_KEEPER, self.ROLE_WANDERER}:
+            return False
+        if self._phase not in {"morning", "evening", "day"}:
+            return False
+        if self.role == self.ROLE_LAMPLIGHTER and self._phase == "evening":
+            return False
+        if self.evening_panic:
             return False
         if self.state != self.EXPLORE:
             return False
@@ -1208,15 +1671,33 @@ class Agent:
         self.social_kind = kind
         self.social_stage = 0
         self.social_stage_tick = 0
-        self.social_point_key = self._choose_point_target()
+        self.social_point_key = (
+            self.home_door_key
+            if kind == "visitor_evening" and self.home_door_key is not None
+            else self._choose_point_target()
+        )
         self.social_sequence = self._build_social_sequence(kind)
 
     def _build_social_sequence(self, kind: str) -> tuple[tuple[str, int], ...]:
-        """Create wave -> random emotes -> wave, always capped at 50 ticks."""
+        """Create a short reaction/conversation, always capped at 50 ticks."""
+
+        # Season 4 visitor reactions tell different stories by phase and role.
+        if kind == "visitor_evening":
+            return (("startle", 5), ("point", 6), ("wave", 4))
+        if kind == "visitor_busy":
+            return (("wave", 3), ("shake_head", 4), ("point", 5))
+        if kind == "visitor_midday":
+            return (("wave", 4), ("nod", 4), ("laugh", 5), ("wave", 4))
+        if kind == "visitor_friendly":
+            return (("wave", 4), ("laugh", 5), ("nod", 4), ("wave", 4))
+        if kind == "visitor_reserved":
+            return (("wave", 4), ("nod", 4), ("wave", 4))
+        if kind == "visitor_calm":
+            return (("wave", 4), ("nod", 5), ("point", 4), ("wave", 4))
 
         config_key = (
             "visitor_middle_actions"
-            if kind == "visitor"
+            if kind.startswith("visitor")
             else "npc_middle_actions"
         )
         low, high = self.config.get(config_key, (2, 4))
@@ -1339,7 +1820,7 @@ class Agent:
 
     def _finish_social(self, tick: int) -> None:
         if self.social_partner is not None:
-            if self.social_kind == "visitor":
+            if self.social_kind is not None and self.social_kind.startswith("visitor"):
                 cooldown = self.rng.randint(220, 320)
             else:
                 cooldown = self.rng.randint(170, 250)
@@ -1349,6 +1830,7 @@ class Agent:
         # for another conversation after the shared social block finishes.
         low, high = self.config.get("social_cooldown", (60, 100))
         self.social_block_until = tick + self.rng.randint(low, high)
+        finished_kind = self.social_kind
         self.social_partner = None
         self.social_kind = None
         self.social_point_key = None
@@ -1356,10 +1838,19 @@ class Agent:
         self.social_stage = 0
         self.social_stage_tick = 0
 
+        # In the haunted-evening story, being approached by the visitor is one
+        # possible startle source. The startle was visible during the reaction, so
+        # nearby villagers may already have begun their own perception-driven exit.
+        if finished_kind == "visitor_evening" and self.role != self.ROLE_LAMPLIGHTER:
+            self.evening_panic = True
+            self.panic_startle_ticks = self.PANIC_STARTLE_TICKS
+            self.panic_arrived_home = False
+            self._clear_navigation(keep_destination=False)
+
     def _passing_expression(self) -> str:
         """Occasionally wave while walking without interrupting the route."""
 
-        if not self._seen:
+        if not self._seen or self._tick - self._last_seen_tick > self.SOCIAL_SCAN_INTERVAL + 1:
             return "none"
         if self._tick - self.last_passing_wave_tick < 45:
             return "none"
@@ -1376,7 +1867,7 @@ class Agent:
     # ------------------------------------------------------------------
 
     def _build_navigation_graph(self, observation: ThreeBranchesObservation) -> None:
-        """Cache all static walkable cells and legal cardinal edges once."""
+        """Build static walkable cells/edges for the shared episode cache."""
 
         cells_x = self.frame["cells_x"]
         cells_y = self.frame["cells_y"]
@@ -1473,7 +1964,7 @@ class Agent:
         )
 
     def _bfs_cached(self, start: CellKey, goal: CellKey) -> list[CellKey]:
-        """BFS over the cached static graph; called only on destination changes."""
+        """Return a route, sharing successful paths across all villagers."""
 
         if start == goal:
             return []
@@ -1481,6 +1972,11 @@ class Agent:
             return []
         if self.component_of.get(start) != self.component_of.get(goal):
             return []
+
+        cache_key = (self._world_cache_key, start, goal)
+        cached = self.__class__._SHARED_PATH_CACHE.get(cache_key)
+        if cached is not None:
+            return list(cached)
 
         queue: deque[CellKey] = deque([start])
         came_from: dict[CellKey, CellKey | None] = {start: None}
@@ -1510,6 +2006,11 @@ class Agent:
             cursor = parent
 
         reversed_path.reverse()
+
+        if len(self.__class__._SHARED_PATH_CACHE) >= self.SHARED_PATH_CACHE_LIMIT:
+            # Clearing is cheaper than LRU bookkeeping and occurs rarely.
+            self.__class__._SHARED_PATH_CACHE.clear()
+        self.__class__._SHARED_PATH_CACHE[cache_key] = tuple(reversed_path)
         return reversed_path
 
     def _choose_approach_key(
@@ -1582,8 +2083,10 @@ class Agent:
             return cls.ROLE_WELL_KEEPER
         if 2 <= index <= 5:
             return cls.ROLE_WORKER
-        if 6 <= index <= 8:
+        if 6 <= index <= 7:
             return cls.ROLE_SWEEPER
+        if index == 8:
+            return cls.ROLE_LAMPLIGHTER
         return cls.ROLE_WANDERER
 
     def _initialize_role_behavior(self) -> None:
@@ -1593,7 +2096,7 @@ class Agent:
             self.keeper_anchor_key, self.keeper_patrol_keys = self._build_keeper_patrol()
         elif self.role == self.ROLE_WORKER:
             self.work_target_key = self._choose_worker_spot()
-        elif self.role == self.ROLE_SWEEPER:
+        elif self.role in {self.ROLE_SWEEPER, self.ROLE_LAMPLIGHTER}:
             self.sweep_route_keys = self._build_sweeper_route()
             if self.sweep_route_keys:
                 self.sweep_route_index = self.player_slot % len(self.sweep_route_keys)
@@ -1825,6 +2328,20 @@ class Agent:
         for key in self.nav_neighbors.get(door_key, ()):
             if self.ground_by_key.get(key) == "interior":
                 return key
+        return None
+
+    def _position_key_fast(self, position: dict[str, float]) -> CellKey | None:
+        """Convert a known in-village position to a cell without a helper call.
+
+        ``layout.cell_at`` is convenient, but this conversion happens on every
+        act() call for ten villagers. The village frame is static, so the simple
+        arithmetic below is equivalent for normal non-negative village positions.
+        """
+
+        x = int(position["x"] / self._cell_size)
+        y = int(position["y"] / self._cell_size)
+        if 0 <= x < self._cells_x and 0 <= y < self._cells_y:
+            return (x, y)
         return None
 
     # ------------------------------------------------------------------
